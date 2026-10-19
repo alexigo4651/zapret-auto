@@ -1,0 +1,2 @@
+# Keep files byte-for-byte: .cmd needs CRLF, .ps1 needs its UTF-8 BOM.
+* -text
