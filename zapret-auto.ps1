@@ -158,6 +158,45 @@ function Install-ZapretService([string]$binPath, [string]$strategy) {
   Start-Service $ServiceName
 }
 
+# Other DPI-bypass tools (another zapret copy, GoodbyeDPI) fight over the same
+# WinDivert driver and make every strategy test fail. Their services are only
+# disabled (reversible), not deleted; stray processes are killed.
+function Disable-OtherBypass {
+  $ourBin = "$InstallDir\bin\"
+  foreach ($key in Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Services') {
+    $name = $key.PSChildName
+    $img = (Get-ItemProperty $key.PSPath -Name ImagePath -ErrorAction SilentlyContinue).ImagePath
+    if (-not $img) { continue }
+
+    if ($name -in 'WinDivert', 'WinDivert14') {
+      # A driver registered from another folder breaks winws if that folder is gone.
+      if ($img -notlike "*$ourBin*") {
+        & sc.exe stop $name 2>&1 | Out-Null
+        & sc.exe delete $name 2>&1 | Out-Null
+        Log "Removed $name driver registration from another folder ($img); winws will register ours" 'Yellow'
+      }
+      continue
+    }
+    if ($img -notmatch 'winws\.exe|goodbyedpi\.exe|nfqws') { continue }
+    if ($name -eq $ServiceName) { continue }   # ours; replaced on install if it points elsewhere
+
+    $svc = Get-Service $name -ErrorAction SilentlyContinue
+    if ($svc -and ($svc.Status -ne 'Stopped' -or $svc.StartType -ne 'Disabled')) {
+      Stop-Service $name -Force -ErrorAction SilentlyContinue
+      Set-Service $name -StartupType Disabled
+      Log "Disabled other DPI-bypass service '$name' (was $($svc.StartType)): $($img.Substring(0, [Math]::Min(120, $img.Length)))" 'Yellow'
+    }
+  }
+
+  $ourPid = (Get-CimInstance Win32_Service -Filter "Name='$ServiceName'" -ErrorAction SilentlyContinue).ProcessId
+  $procs = Get-CimInstance Win32_Process -Filter "Name='winws.exe' OR Name='goodbyedpi.exe'" -ErrorAction SilentlyContinue
+  foreach ($p in $procs) {
+    if ($p.ProcessId -eq $ourPid) { continue }
+    Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+    Log "Stopped other DPI-bypass process $($p.Name) ($($p.ExecutablePath))" 'Yellow'
+  }
+}
+
 # Strategies with "--dpi-desync-fooling=ts" need TCP timestamps (service.bat does the same).
 function Enable-TcpTimestamps {
   $out = & netsh interface tcp show global
@@ -315,11 +354,29 @@ function Get-ListEntries([string]$path, [switch]$allowIp) {
   $res
 }
 
+# Fresh releases ship without the *-user.txt lists, but every strategy passes
+# them to winws, which exits at once if a list is missing. Create them the
+# same way service.bat (load_user_lists) does.
+function Initialize-UserLists([string]$dir) {
+  $defaults = [ordered]@{
+    'ipset-exclude-user.txt' = @('203.0.113.113/32')
+    'list-general-user.txt'  = @('# Never leave this file empty', 'domain.example.abc')
+    'list-exclude-user.txt'  = @('domain.example.abc')
+  }
+  foreach ($name in $defaults.Keys) {
+    $file = Join-Path $dir "lists\$name"
+    if (-not (Test-Path $file)) {
+      Set-Content -Path $file -Value $defaults[$name] -Encoding ASCII
+      Log "Created lists\$name"
+    }
+  }
+}
+
 # Keeps a zapret list file in sync with $items: adds new ones and removes the
 # ones this script added earlier (remembered in $managed) that are no longer
 # wanted. Lines typed into the zapret file by hand are never touched.
 # Returns $true if the file changed.
-function Sync-HostList([string]$file, [string]$managed, [string[]]$items) {
+function Sync-HostList([string]$file, [string]$managed, [string[]]$items, [string]$placeholder) {
   $items = @($items | Where-Object { $_ })
   $lines = if (Test-Path $file) { @(Get-Content $file | ForEach-Object { $_.Trim() } | Where-Object { $_ }) } else { @() }
   $prev  = if (Test-Path $managed) { @(Get-Content $managed) } else { @() }
@@ -330,6 +387,8 @@ function Sync-HostList([string]$file, [string]$managed, [string[]]$items) {
 
   Set-Content -Path $managed -Value $items -Encoding ASCII
   if (-not $added -and -not $removed) { return $false }
+  # winws refuses an empty list file, so keep the same placeholder service.bat uses.
+  if (-not ($new | Where-Object { -not $_.StartsWith('#') })) { $new += $placeholder }
   Set-Content -Path $file -Value $new -Encoding ASCII
   $name = Split-Path $file -Leaf
   if ($added)   { Log "Added to ${name}: $($added -join ', ')" }
@@ -533,6 +592,8 @@ try {
     exit 0
   }
 
+  Disable-OtherBypass
+
   $updated = $false
   $local = Get-LocalVersion
   if (-not $NoUpdate -and -not $Repick) {
@@ -548,10 +609,11 @@ try {
     }
   }
   if (-not (Test-Path "$InstallDir\bin\winws.exe")) { throw "zapret is not installed in $InstallDir" }
+  Initialize-UserLists $InstallDir
   $lists = "$InstallDir\lists"
-  $changed = Sync-HostList "$lists\list-general-user.txt" $ManagedFile (@($ExtraDomains) + $userSites | Select-Object -Unique)
-  $changed = (Sync-HostList "$lists\list-exclude-user.txt" $ManagedExcludeFile $excl.Domains) -or $changed
-  $changed = (Sync-HostList "$lists\ipset-exclude-user.txt" $ManagedIpExcludeFile $excl.Ips) -or $changed
+  $changed = Sync-HostList "$lists\list-general-user.txt" $ManagedFile (@($ExtraDomains) + $userSites | Select-Object -Unique) 'domain.example.abc'
+  $changed = (Sync-HostList "$lists\list-exclude-user.txt" $ManagedExcludeFile $excl.Domains 'domain.example.abc') -or $changed
+  $changed = (Sync-HostList "$lists\ipset-exclude-user.txt" $ManagedIpExcludeFile $excl.Ips '203.0.113.113/32') -or $changed
   if ($changed) {
     # Restart so winws reloads the lists before the checks below.
     if ((Get-Service $ServiceName -ErrorAction SilentlyContinue).Status -eq 'Running') {
