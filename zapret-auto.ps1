@@ -158,6 +158,19 @@ function Install-ZapretService([string]$binPath, [string]$strategy) {
   Start-Service $ServiceName
 }
 
+# True once every 'control' site opens. Used to tell "no internet" (network
+# drop, wake from sleep, boot) from "the strategy broke something".
+function Wait-Internet([int]$seconds) {
+  $urls = @($Targets | Where-Object { $_.Group -eq 'control' } | ForEach-Object { $_.Url })
+  $deadline = (Get-Date).AddSeconds($seconds)
+  while ($true) {
+    $down = $urls | Where-Object { & curl.exe --noproxy '*' -s -o NUL -m 5 $_; $LASTEXITCODE -ne 0 }
+    if (-not $down) { return $true }
+    if ((Get-Date) -ge $deadline) { return $false }
+    Start-Sleep -Seconds 5
+  }
+}
+
 # Other DPI-bypass tools (another zapret copy, GoodbyeDPI) fight over the same
 # WinDivert driver and make every strategy test fail. Their services are only
 # disabled (reversible), not deleted; stray processes are killed.
@@ -593,6 +606,24 @@ try {
   }
 
   Disable-OtherBypass
+
+  if (-not (Wait-Internet 60)) {
+    # Even the control site fails: is it the network or zapret itself?
+    $svcUp = (Get-Service $ServiceName -ErrorAction SilentlyContinue).Status -eq 'Running'
+    if ($svcUp) {
+      Save-RestorePoint $null
+      Stop-Service $ServiceName -Force
+    }
+    if ($svcUp -and (Wait-Internet 15)) {
+      Log 'Normal sites open only with zapret off: the strategy breaks the internet, re-picking.' 'Yellow'
+      $Repick = $true
+    } else {
+      if ($svcUp) { Start-Service $ServiceName }
+      Remove-Item $RestoreFile -Force -ErrorAction SilentlyContinue
+      Log 'No internet connection: nothing changed, will check on the next run.' 'Yellow'
+      exit 0
+    }
+  }
 
   $updated = $false
   $local = Get-LocalVersion
